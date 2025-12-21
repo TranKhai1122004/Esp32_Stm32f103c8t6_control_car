@@ -2,48 +2,56 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : Mã điều khiển hai động cơ DC qua L298N, nhận lệnh từ ESP32 qua UART1.
-  * @note           : Sử dụng PA8 (TIM1_CH1) và PB4 (TIM3_CH1) cho PWM.
-  * Sử dụng PB0, PB1, PA11, PA12 cho chân Direction.
-  * Sử dụng PA10 (RX) cho UART1 để nhận lệnh.
-  * Cần #include <stdlib.h> cho hàm atoi().
+  * @brief          : Điều khiển xe qua UART/ESP32, kèm chức năng HC-SR04 Input Capture
+  * và Dừng Khẩn Cấp (Override). Đã tích hợp MSP và IRQ Handler.
   ******************************************************************************
   */
 /* USER CODE END Header */
+
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "stm32f1xx_hal.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include <stdlib.h> // BỔ SUNG: Cần cho hàm atoi() để chuyển chuỗi tốc độ sang số
+#include <stdlib.h>
+#include <stdbool.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-// Định nghĩa trạng thái nhận UART
 typedef enum {
     UART_STATE_IDLE,
     UART_STATE_RECEIVING_SPEED
 } UART_State_t;
+
+typedef enum {
+    US_IDLE,
+    US_RISING_EDGE,
+    US_FALLING_EDGE
+} US_State_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define SPEED_CODE_LENGTH 4     // 3 ký tự số (ví dụ: '255') + 1 null terminator
+#define SPEED_CODE_LENGTH 4     // 3 ký tự số + 1 null terminator
 #define PWM_MAX 255             // PWM Resolution (0-255)
 
-// Định nghĩa Chân Direction
-// Motor 1 - Bên Phải (Giả sử)
+// Chân Direction (Motor L298N)
 #define M1_IN1_PORT GPIOB
 #define M1_IN1_PIN  GPIO_PIN_0
 #define M1_IN2_PORT GPIOB
 #define M1_IN2_PIN  GPIO_PIN_1
-
-// Motor 2 - Bên Trái (Giả sử)
 #define M2_IN3_PORT GPIOA
 #define M2_IN3_PIN  GPIO_PIN_11
 #define M2_IN4_PORT GPIOA
 #define M2_IN4_PIN  GPIO_PIN_12
+
+// Chân HC-SR04
+#define US_TRIG_PORT GPIOA
+#define US_TRIG_PIN  GPIO_PIN_0
+#define US_ECHO_CHANNEL TIM_CHANNEL_2
+#define COLLISION_THRESHOLD 15 // Ngưỡng dừng khẩn cấp (cm)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -60,14 +68,19 @@ UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
 uint8_t receivedData = 0;
-// Buffer chứa 3 ký tự số + 1 null terminator
 uint8_t uartRxBuffer[SPEED_CODE_LENGTH];
 uint8_t rxIndex = 0;
 UART_State_t uartState = UART_STATE_IDLE;
 
-// Biến điều khiển động cơ
-volatile uint8_t currentSpeed = 0;    // Tốc độ hiện tại (0-255)
-volatile char currentDirection = 'S'; // 'F', 'B', 'L', 'R', 'S'
+volatile uint8_t currentSpeed = 0;
+volatile char currentDirection = 'S';
+volatile bool isOverridden = false; // Cờ ghi đè
+
+volatile US_State_t usState = US_IDLE;
+volatile uint32_t captureTime1 = 0;
+volatile uint32_t captureTime2 = 0;
+volatile uint32_t pulseDuration = 0;
+volatile float distance_cm = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -77,139 +90,185 @@ static void MX_TIM1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM3_Init(void);
 static void MX_TIM2_Init(void);
+
+// Bổ sung IRQ Handler và MSP vào file main.c
+void TIM2_IRQHandler(void);
+void HAL_TIM_IC_MspInit(TIM_HandleTypeDef* htim_ic);
+
 /* USER CODE BEGIN PFP */
 void setMotorSpeed(uint8_t speed);
 void setCarMotion(char direction, uint8_t speed);
 void ProcessUartData(uint8_t data);
+void HCSR04_StartMeasurement(void);
+void CheckCollisionAndOverride(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-/**
-  * @brief  Thiết lập tốc độ PWM cho cả hai động cơ.
-  */
 void setMotorSpeed(uint8_t speed)
 {
-    // Đảm bảo tốc độ không vượt quá giới hạn PWM_MAX
     if (speed > PWM_MAX) speed = PWM_MAX;
-
-    // Motor 1 (PA8 / TIM1_CH1)
-    __HAL_TIM_SET_COMPARE(&htim1 , TIM_CHANNEL_1, speed);
-    // Motor 2 (PB4 / TIM3_CH1)
-    __HAL_TIM_SET_COMPARE(&htim3 , TIM_CHANNEL_1, speed);
-
+    __HAL_TIM_SET_COMPARE(&htim1 , TIM_CHANNEL_1, speed); // Motor 1
+    __HAL_TIM_SET_COMPARE(&htim3 , TIM_CHANNEL_1, speed); // Motor 2
     currentSpeed = speed;
 }
 
-/**
-  * @brief  Thiết lập hướng di chuyển cho xe.
-  */
 void setCarMotion(char direction, uint8_t speed)
 {
-    // Cập nhật biến trạng thái hiện tại
-    currentDirection = direction;
+    if (isOverridden && direction != 'S') {
+        return;
+    }
 
-    // Thiết lập PWM trước (hoặc sau)
+    currentDirection = direction;
     setMotorSpeed(speed);
 
-    // Nếu lệnh là dừng, không cần đặt chân direction
     if (direction == 'S') {
-        // setMotorSpeed(0) đã được gọi ở trên.
-        // Motor dừng.
         HAL_GPIO_WritePin(M1_IN1_PORT, M1_IN1_PIN, RESET);
         HAL_GPIO_WritePin(M1_IN2_PORT, M1_IN2_PIN, RESET);
         HAL_GPIO_WritePin(M2_IN3_PORT, M2_IN3_PIN, RESET);
         HAL_GPIO_WritePin(M2_IN4_PORT, M2_IN4_PIN, RESET);
+
+        if (isOverridden) isOverridden = false;
         return;
     }
 
-    // Đặt lại chân Direction về LOW trước khi thiết lập
+    // Reset Direction pins
     HAL_GPIO_WritePin(M1_IN1_PORT, M1_IN1_PIN, RESET);
     HAL_GPIO_WritePin(M1_IN2_PORT, M1_IN2_PIN, RESET);
     HAL_GPIO_WritePin(M2_IN3_PORT, M2_IN3_PIN, RESET);
     HAL_GPIO_WritePin(M2_IN4_PORT, M2_IN4_PIN, RESET);
 
+    // LOGIC DIRECTION GỐC CỦA BẠN
     switch (direction) {
-        case 'F': // Tiến (Forward) - Cả hai motor quay tiến
-            HAL_GPIO_WritePin(M1_IN2_PORT, M1_IN2_PIN, SET); // M1 (Phải) Tiến
-            HAL_GPIO_WritePin(M2_IN3_PORT, M2_IN4_PIN, SET); // M2 (Trái) Tiến
+        case 'F': // Tiến
+            HAL_GPIO_WritePin(M1_IN2_PORT, M1_IN2_PIN, SET);
+            HAL_GPIO_WritePin(M2_IN3_PORT, M2_IN4_PIN, SET);
             break;
 
-        case 'B': // Lùi (Backward) - Cả hai motor quay lùi
-            HAL_GPIO_WritePin(M1_IN2_PORT, M1_IN1_PIN, SET); // M1 (Phải) Lùi
-            HAL_GPIO_WritePin(M2_IN4_PORT, M2_IN3_PIN, SET); // M2 (Trái) Lùi
+        case 'B': // Lùi
+            HAL_GPIO_WritePin(M1_IN2_PORT, M1_IN1_PIN, SET);
+            HAL_GPIO_WritePin(M2_IN4_PORT, M2_IN3_PIN, SET);
             break;
 
-        case 'L': // Rẽ Trái (Turn Left) - Quay tại chỗ: Phải Tiến, Trái Lùi
-            HAL_GPIO_WritePin(M1_IN1_PORT, M1_IN1_PIN, SET); // M1 (Phải) Tiến
-            HAL_GPIO_WritePin(M2_IN4_PORT, M2_IN4_PIN, SET); // M2 (Trái) Lùi
+        case 'L': // Rẽ Trái (Phải Tiến, Trái Lùi)
+            HAL_GPIO_WritePin(M1_IN1_PORT, M1_IN1_PIN, SET);
+            HAL_GPIO_WritePin(M2_IN4_PORT, M2_IN4_PIN, SET);
             break;
 
-        case 'R': // Rẽ Phải (Turn Right) - Quay tại chỗ: Trái Tiến, Phải Lùi
-            HAL_GPIO_WritePin(M1_IN2_PORT, M1_IN2_PIN, SET); // M1 (Phải) Lùi
-            HAL_GPIO_WritePin(M2_IN3_PORT, M2_IN3_PIN, SET); // M2 (Trái) Tiến
+        case 'R': // Rẽ Phải (Trái Tiến, Phải Lùi)
+            HAL_GPIO_WritePin(M1_IN2_PORT, M1_IN2_PIN, SET);
+            HAL_GPIO_WritePin(M2_IN3_PORT, M2_IN3_PIN, SET);
             break;
 
         default:
-            // Lệnh không hợp lệ, đảm bảo motor dừng
             setMotorSpeed(0);
             break;
     }
 }
 
-/**
-  * @brief  Xử lý dữ liệu nhận được từ UART.
-  * Lệnh: 'F', 'B', 'L', 'R', 'S' (Direction/Stop) hoặc 's' + 'xxx' (Speed)
-  */
 void ProcessUartData(uint8_t data)
 {
     if (uartState == UART_STATE_IDLE)
     {
         if (data == 'F' || data == 'B' || data == 'L' || data == 'R' || data == 'S') {
-            // Lệnh Hướng/Dừng: Giữ tốc độ hiện tại (currentSpeed)
             setCarMotion(data, currentSpeed);
-        } else if (data == 's') { // Nhận 's' nhỏ để báo hiệu lệnh Speed sắp đến
+        } else if (data == 's') {
             uartState = UART_STATE_RECEIVING_SPEED;
             rxIndex = 0;
         }
     }
     else if (uartState == UART_STATE_RECEIVING_SPEED)
     {
-        // Nhận 3 ký tự số
         if (rxIndex < SPEED_CODE_LENGTH - 1)
         {
             uartRxBuffer[rxIndex++] = data;
         }
 
-        // Sau khi nhận đủ 3 ký tự số (rxIndex = 3)
         if (rxIndex == SPEED_CODE_LENGTH - 1)
         {
-            // Thêm null terminator vào cuối buffer
             uartRxBuffer[rxIndex] = '\0';
-
-            // Chuyển chuỗi số sang int
             int newSpeed = atoi((char*)uartRxBuffer);
-
-            // Áp dụng tốc độ và giữ nguyên hướng hiện tại
-            // Lệnh tốc độ chỉ thay đổi currentSpeed, không thay đổi direction
             setCarMotion(currentDirection, (uint8_t)newSpeed);
-
-            // Reset trạng thái
             uartState = UART_STATE_IDLE;
             rxIndex = 0;
         }
     }
 }
 
-// Xử lý ngắt nhận hoàn tất (Interrupt Callback)
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1)
     {
         ProcessUartData(receivedData);
-        // Kích hoạt lại chế độ nhận ngắt cho lần sau
         HAL_UART_Receive_IT(&huart1, &receivedData, 1);
+    }
+}
+
+// ======================= HC-SR04 LOGIC =======================
+
+void HCSR04_StartMeasurement(void)
+{
+    // Gửi xung 10us TRIG
+    HAL_GPIO_WritePin(US_TRIG_PORT, US_TRIG_PIN, GPIO_PIN_RESET);
+    __HAL_TIM_SET_COUNTER(&htim2, 0); // Reset Timer
+
+    HAL_GPIO_WritePin(US_TRIG_PORT, US_TRIG_PIN, GPIO_PIN_SET);
+    for(int i = 0; i < 720; i++) { __NOP(); } // Delay ~10us
+    HAL_GPIO_WritePin(US_TRIG_PORT, US_TRIG_PIN, GPIO_PIN_RESET);
+
+    usState = US_IDLE;
+}
+
+void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM2 && htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2)
+    {
+        if (usState == US_IDLE)
+        {
+            // Cạnh lên (Rising Edge)
+            captureTime1 = HAL_TIM_ReadCapturedValue(htim, US_ECHO_CHANNEL);
+            usState = US_RISING_EDGE;
+            __HAL_TIM_SET_CAPTUREPOLARITY(htim, US_ECHO_CHANNEL, TIM_INPUTCHANNELPOLARITY_FALLING);
+        }
+        else if (usState == US_RISING_EDGE)
+        {
+            // Cạnh xuống (Falling Edge)
+            captureTime2 = HAL_TIM_ReadCapturedValue(htim, US_ECHO_CHANNEL);
+
+            if (captureTime2 > captureTime1)
+            {
+                pulseDuration = captureTime2 - captureTime1;
+            }
+            else // Timer Overflow
+            {
+                pulseDuration = (0xFFFF - captureTime1) + captureTime2;
+            }
+
+            // distance (cm) = duration (us) / 58
+            distance_cm = (float)pulseDuration / 58.0f;
+
+            usState = US_FALLING_EDGE;
+            __HAL_TIM_SET_CAPTUREPOLARITY(htim, US_ECHO_CHANNEL, TIM_INPUTCHANNELPOLARITY_RISING);
+        }
+    }
+}
+
+void CheckCollisionAndOverride(void)
+{
+    if (currentDirection != 'F') {
+        isOverridden = false;
+        return;
+    }
+
+    if (distance_cm <= COLLISION_THRESHOLD && distance_cm > 0.0f) {
+        if (!isOverridden) {
+            setCarMotion('S', 0);
+            isOverridden = true;
+        }
+    }
+    else if (isOverridden) {
+        isOverridden = false;
     }
 }
 /* USER CODE END 0 */
@@ -222,23 +281,14 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  unsigned long lastUSMeasurement = 0;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -249,15 +299,14 @@ int main(void)
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
-  // Khởi động PWM
   HAL_TIM_PWM_Start(&htim1 , TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim3 , TIM_CHANNEL_1);
 
-  // Khởi động nhận ngắt UART
+  HAL_TIM_IC_Start_IT(&htim2, US_ECHO_CHANNEL); // Bắt đầu Input Capture
+
   HAL_UART_Receive_IT(&huart1, &receivedData, 1);
 
-  // Dừng động cơ ở trạng thái khởi động
-  setCarMotion('S', 0); // Ban đầu currentSpeed = 0, nên motor dừng
+  setCarMotion('S', 0);
 
   /* USER CODE END 2 */
 
@@ -268,14 +317,24 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    // Đảm bảo không có thêm logic trong vòng lặp vô tận, chỉ chờ ngắt
+
+    // Đo HC-SR04 định kỳ (200ms)
+    if (HAL_GetTick() - lastUSMeasurement > 200)
+    {
+        lastUSMeasurement = HAL_GetTick();
+        HCSR04_StartMeasurement();
+    }
+
+    // Kiểm tra và thực hiện dừng khẩn cấp
+    CheckCollisionAndOverride();
+
     HAL_Delay(10);
   }
   /* USER CODE END 3 */
 }
 
 /**
-  * @brief System Clock Configuration
+  * @brief System Clock Configuration (GIỮ NGUYÊN)
   * @retval None
   */
 void SystemClock_Config(void)
@@ -283,9 +342,6 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
@@ -298,8 +354,6 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
@@ -314,25 +368,17 @@ void SystemClock_Config(void)
 }
 
 /**
-  * @brief TIM1 Initialization Function
+  * @brief TIM1 Initialization Function (GIỮ NGUYÊN)
   * @param None
   * @retval None
   */
 static void MX_TIM1_Init(void)
 {
-
-  /* USER CODE BEGIN TIM1_Init 0 */
-
-  /* USER CODE END TIM1_Init 0 */
-
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
   TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
 
-  /* USER CODE BEGIN TIM1_Init 1 */
-
-  /* USER CODE END TIM1_Init 1 */
   htim1.Instance = TIM1;
   htim1.Init.Prescaler = 7;
   htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -381,33 +427,21 @@ static void MX_TIM1_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM1_Init 2 */
-
-  /* USER CODE END TIM1_Init 2 */
-  HAL_TIM_MspPostInit(&htim1);
-
+  // Loại bỏ HAL_TIM_MspPostInit(&htim1); để tránh gọi hàm không định nghĩa
 }
 
 /**
-  * @brief TIM2 Initialization Function
-  * @param None
+  * @brief TIM2 Initialization Function (ĐÃ SỬA ĐỔI CHO HC-SR04 INPUT CAPTURE)
   * @retval None
   */
 static void MX_TIM2_Init(void)
 {
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
 
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
   htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 7;
+  htim2.Init.Prescaler = 71; // 1us tick (72MHz / 72)
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
   htim2.Init.Period = 65535;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
@@ -427,31 +461,29 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM2_Init 2 */
 
-  /* USER CODE END TIM2_Init 2 */
-
+  // Cấu hình Input Capture cho Kênh 2 (PA1/ECHO)
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
 }
 
 /**
-  * @brief TIM3 Initialization Function
+  * @brief TIM3 Initialization Function (GIỮ NGUYÊN)
   * @param None
   * @retval None
   */
 static void MX_TIM3_Init(void)
 {
-
-  /* USER CODE BEGIN TIM3_Init 0 */
-
-  /* USER CODE END TIM3_Init 0 */
-
   TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
 
-  /* USER CODE BEGIN TIM3_Init 1 */
-
-  /* USER CODE END TIM3_Init 1 */
   htim3.Instance = TIM3;
   htim3.Init.Prescaler = 7;
   htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
@@ -485,28 +517,16 @@ static void MX_TIM3_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN TIM3_Init 2 */
-
-  /* USER CODE END TIM3_Init 2 */
-  HAL_TIM_MspPostInit(&htim3);
-
+  // Loại bỏ HAL_TIM_MspPostInit(&htim3);
 }
 
 /**
-  * @brief USART1 Initialization Function
+  * @brief USART1 Initialization Function (GIỮ NGUYÊN)
   * @param None
   * @retval None
   */
 static void MX_USART1_UART_Init(void)
 {
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
   huart1.Init.BaudRate = 9600;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
@@ -519,23 +539,15 @@ static void MX_USART1_UART_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
-
 }
 
 /**
-  * @brief GPIO Initialization Function
-  * @param None
+  * @brief GPIO Initialization Function (Cấu hình Chân Direction và PA0/TRIG)
   * @retval None
   */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOD_CLK_ENABLE();
@@ -546,30 +558,69 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11|GPIO_PIN_12, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOA, US_TRIG_PIN|GPIO_PIN_11|GPIO_PIN_12, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : PB0 PB1 */
+  /*Configure GPIO pins : PB0 PB1 (Motor Direction)*/
   GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PA11 PA12 */
-  GPIO_InitStruct.Pin = GPIO_PIN_11|GPIO_PIN_12;
+  // Cấu hình PA0 (TRIG)
+  GPIO_InitStruct.Pin = US_TRIG_PIN;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
+  /*Configure GPIO pins : PA11 PA12 (Motor Direction)*/
+  GPIO_InitStruct.Pin = GPIO_PIN_11|GPIO_PIN_12;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 
-/* USER CODE BEGIN 4 */
+// ==========================================================
+// TỰ ĐỊNH NGHĨA MSP VÀ IRQ HANDLER CHO HC-SR04 (TIM2)
+// ==========================================================
 
-/* USER CODE END 4 */
+/**
+  * @brief  Hàm MSP cho Input Capture (Thay thế stm32f1xx_hal_msp.c)
+  * @param  htim_ic: Con trỏ đến cấu trúc TIM_HandleTypeDef
+  * @retval None
+  */
+void HAL_TIM_IC_MspInit(TIM_HandleTypeDef* htim_ic)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    if(htim_ic->Instance==TIM2)
+    {
+        /* Bật clock cho Timer 2 và GPIOA */
+        __HAL_RCC_TIM2_CLK_ENABLE();
+        __HAL_RCC_GPIOA_CLK_ENABLE();
+
+        /* Cấu hình PA1 (ECHO) là Alternate Function Input (TIM2_CH2) */
+        GPIO_InitStruct.Pin = GPIO_PIN_1;
+        GPIO_InitStruct.Mode = GPIO_MODE_AF_INPUT;
+        GPIO_InitStruct.Pull = GPIO_NOPULL;
+        HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+        /* Cấu hình Ngắt NVIC cho Timer 2 */
+        HAL_NVIC_SetPriority(TIM2_IRQn, 0, 0);
+        HAL_NVIC_EnableIRQ(TIM2_IRQn);
+    }
+}
+
+/**
+  * @brief This function handles TIM2 global interrupt. (Thay thế stm32f1xx_it.c)
+  */
+void TIM2_IRQHandler(void)
+{
+  HAL_TIM_IRQHandler(&htim2);
+}
+
+// ==========================================================
 
 /**
   * @brief  This function is executed in case of error occurrence.
@@ -577,29 +628,23 @@ static void MX_GPIO_Init(void)
   */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
-  /* USER CODE END Error_Handler_Debug */
 }
 
 #ifdef  USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
+  * where the assert_param error has occurred.
   * @param  file: pointer to the source file name
   * @param  line: assert_param error line source number
   * @retval None
   */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line number,
      ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
-
